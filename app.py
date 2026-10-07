@@ -88,10 +88,10 @@ except Exception as e:
 # ============================================================
 
 # Primary model
-PRIMARY_MODEL = "gemini-3.6-flash"
+PRIMARY_MODEL = "gemini-3.5-flash"
 
 # Backup model
-BACKUP_MODEL = "gemini-3.5-flash"
+BACKUP_MODEL = "gemini-3.7-flash"
 
 
 # ============================================================
