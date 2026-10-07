@@ -1,21 +1,23 @@
 import streamlit as st
 import fitz
 import os
-import time
 import io
+import time
 import numpy as np
 import pandas as pd
 import pytesseract
 
 from PIL import Image
 from dotenv import load_dotenv
+
 from google import genai
 from google.genai import types
+
 from sentence_transformers import SentenceTransformer
 
 
 # ============================================================
-# CONFIGURATION
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -24,15 +26,41 @@ st.set_page_config(
     layout="wide"
 )
 
-MODEL_NAME = "gemini-3.7-flash"
 
-# Load environment variables
+# ============================================================
+# APPLICATION TITLE
+# ============================================================
+
+st.title("📄 DocMind AI")
+
+st.subheader(
+    "Multimodal Document Intelligence and Evidence-Based Question Answering"
+)
+
+st.write(
+    """
+    Upload one or more PDF documents and ask questions about their
+    text, tables, scanned pages, charts, graphs and images.
+    
+    DocMind AI retrieves relevant evidence and uses a Vision-Language
+    Model to generate answers with document and page-level citations.
+    """
+)
+
+
+# ============================================================
+# LOAD ENVIRONMENT VARIABLES
+# ============================================================
+
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_REAL_KEY":
-    st.error("Gemini API key is missing. Please check your .env file.")
+
+if not GEMINI_API_KEY:
+    st.error(
+        "Gemini API key not found. Please check your .env file."
+    )
     st.stop()
 
 
@@ -40,31 +68,36 @@ if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_REAL_KEY":
 # GEMINI CLIENT
 # ============================================================
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+try:
 
-
-# ============================================================
-# SENTENCE TRANSFORMER MODEL
-# ============================================================
-
-@st.cache_resource
-def load_embedding_model():
-
-    model = SentenceTransformer(
-        "sentence-transformers/all-MiniLM-L6-v2"
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
     )
 
-    return model
+except Exception as e:
 
+    st.error(
+        f"Unable to initialize Gemini client: {e}"
+    )
 
-embedding_model = load_embedding_model()
+    st.stop()
 
 
 # ============================================================
-# TESSERACT CONFIGURATION
+# GEMINI MODELS
 # ============================================================
 
-# Windows Tesseract installation path
+# Primary model
+PRIMARY_MODEL = "gemini-3.6-flash"
+
+# Backup model
+BACKUP_MODEL = "gemini-3.5-flash"
+
+
+# ============================================================
+# TESSERACT OCR CONFIGURATION
+# ============================================================
+
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 if os.path.exists(TESSERACT_PATH):
@@ -73,29 +106,28 @@ if os.path.exists(TESSERACT_PATH):
 
 
 # ============================================================
-# SESSION STATE
+# LOAD SENTENCE TRANSFORMER
 # ============================================================
 
-if "pages" not in st.session_state:
-    st.session_state.pages = []
+@st.cache_resource
+def load_embedding_model():
 
-if "embeddings" not in st.session_state:
-    st.session_state.embeddings = None
+    return SentenceTransformer(
+        "all-MiniLM-L6-v2"
+    )
+
+
+embedding_model = load_embedding_model()
 
 
 # ============================================================
 # OCR FUNCTION
 # ============================================================
 
-def extract_ocr_text(image_bytes):
+def perform_ocr(image):
 
     try:
 
-        image = Image.open(
-            io.BytesIO(image_bytes)
-        )
-
-        # OCR
         text = pytesseract.image_to_string(
             image
         )
@@ -108,24 +140,32 @@ def extract_ocr_text(image_bytes):
 
 
 # ============================================================
-# PDF PAGE IMAGE FUNCTION
+# RENDER PDF PAGE AS IMAGE
 # ============================================================
 
-def render_page_image(page):
+def render_page(page):
 
     try:
 
-        # Render PDF page
-        matrix = fitz.Matrix(1.5, 1.5)
+        matrix = fitz.Matrix(
+            1.5,
+            1.5
+        )
 
         pix = page.get_pixmap(
             matrix=matrix,
             alpha=False
         )
 
-        image_bytes = pix.tobytes("png")
+        image_bytes = pix.tobytes(
+            "png"
+        )
 
-        return image_bytes
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        )
+
+        return image
 
     except Exception:
 
@@ -133,7 +173,7 @@ def render_page_image(page):
 
 
 # ============================================================
-# TABLE EXTRACTION
+# EXTRACT TABLES
 # ============================================================
 
 def extract_tables(page):
@@ -142,17 +182,19 @@ def extract_tables(page):
 
     try:
 
-        page_tables = page.find_tables()
+        table_finder = page.find_tables()
 
-        for table in page_tables.tables:
+        for table in table_finder.tables:
 
             try:
 
-                df = table.to_pandas()
+                dataframe = table.to_pandas()
 
-                if not df.empty:
+                if dataframe is not None:
 
-                    tables.append(df)
+                    tables.append(
+                        dataframe
+                    )
 
             except Exception:
 
@@ -166,149 +208,203 @@ def extract_tables(page):
 
 
 # ============================================================
-# PROCESS PDF
+# PROCESS ONE PDF
 # ============================================================
 
 def process_pdf(uploaded_file):
 
-    document_pages = []
+    document_name = uploaded_file.name
 
-    try:
+    pdf_bytes = uploaded_file.read()
 
-        pdf_bytes = uploaded_file.read()
+    pdf_document = fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf"
+    )
 
-        pdf = fitz.open(
-            stream=pdf_bytes,
-            filetype="pdf"
+    pages = []
+
+    for page_index in range(
+        len(pdf_document)
+    ):
+
+        page_number = page_index + 1
+
+        page = pdf_document[
+            page_index
+        ]
+
+        # ----------------------------------------------------
+        # Extract normal PDF text
+        # ----------------------------------------------------
+
+        extracted_text = page.get_text(
+            "text"
+        ).strip()
+
+
+        # ----------------------------------------------------
+        # Render page
+        # ----------------------------------------------------
+
+        page_image = render_page(
+            page
         )
 
-        total_pages = len(pdf)
 
-        progress = st.progress(0)
+        # ----------------------------------------------------
+        # OCR if page contains little/no text
+        # ----------------------------------------------------
 
-        status = st.empty()
+        ocr_used = False
 
-        for page_number, page in enumerate(pdf):
+        ocr_text = ""
 
-            status.text(
-                f"Processing {uploaded_file.name} "
-                f"- Page {page_number + 1}/{total_pages}"
+        if (
+            len(extracted_text) < 50
+            and page_image is not None
+        ):
+
+            ocr_text = perform_ocr(
+                page_image
             )
 
-            # ------------------------------------------------
-            # TEXT EXTRACTION
-            # ------------------------------------------------
+            if len(ocr_text) > len(
+                extracted_text
+            ):
 
-            text = page.get_text("text").strip()
+                extracted_text = ocr_text
 
-            # ------------------------------------------------
-            # TABLE EXTRACTION
-            # ------------------------------------------------
+                ocr_used = True
 
-            tables = extract_tables(page)
 
-            # ------------------------------------------------
-            # PAGE IMAGE
-            # ------------------------------------------------
+        # ----------------------------------------------------
+        # Extract tables
+        # ----------------------------------------------------
 
-            image_bytes = render_page_image(page)
+        tables = extract_tables(
+            page
+        )
 
-            # ------------------------------------------------
-            # OCR
-            # ------------------------------------------------
 
-            ocr_used = False
+        # ----------------------------------------------------
+        # Convert tables to text
+        # ----------------------------------------------------
 
-            # If normal text extraction gives little text,
-            # use OCR for scanned/image-only pages.
+        table_text_parts = []
 
-            if len(text) < 50 and image_bytes is not None:
+        for table_number, dataframe in enumerate(
+            tables,
+            start=1
+        ):
 
-                ocr_text = extract_ocr_text(
-                    image_bytes
-                )
+            try:
 
-                if len(ocr_text) > len(text):
-
-                    text = ocr_text
-
-                    ocr_used = True
-
-            # ------------------------------------------------
-            # TABLE TEXT
-            # ------------------------------------------------
-
-            table_text = ""
-
-            for table_index, df in enumerate(tables):
-
-                table_text += (
-                    f"\nTable {table_index + 1}:\n"
-                )
-
-                table_text += df.to_string(
+                table_text = dataframe.to_string(
                     index=False
                 )
 
-                table_text += "\n"
+                table_text_parts.append(
+                    f"Table {table_number}:\n{table_text}"
+                )
 
-            # ------------------------------------------------
-            # COMBINED SEARCH TEXT
-            # ------------------------------------------------
+            except Exception:
 
-            search_text = (
-                text
-                + "\n"
+                continue
+
+
+        table_text = "\n\n".join(
+            table_text_parts
+        )
+
+
+        # ----------------------------------------------------
+        # Unified searchable content
+        # ----------------------------------------------------
+
+        search_text = extracted_text
+
+        if table_text:
+
+            search_text += (
+                "\n\n"
                 + table_text
             )
 
-            # ------------------------------------------------
-            # PAGE INFORMATION
-            # ------------------------------------------------
 
-            page_data = {
+        # ----------------------------------------------------
+        # Save page information
+        # ----------------------------------------------------
 
-                "document": uploaded_file.name,
-
-                "page": page_number + 1,
-
-                "text": text,
-
+        pages.append(
+            {
+                "document": document_name,
+                "page": page_number,
+                "text": extracted_text,
                 "tables": tables,
-
                 "table_text": table_text,
-
                 "search_text": search_text,
-
-                "image": image_bytes,
-
+                "image": page_image,
                 "ocr_used": ocr_used
-
             }
-
-            document_pages.append(
-                page_data
-            )
-
-            progress.progress(
-                (page_number + 1) / total_pages
-            )
-
-        status.empty()
-
-        progress.empty()
-
-        pdf.close()
-
-        return document_pages
-
-    except Exception as e:
-
-        st.error(
-            f"Error processing {uploaded_file.name}: {e}"
         )
 
-        return []
+
+    pdf_document.close()
+
+    return pages
+
+
+# ============================================================
+# PROCESS ALL DOCUMENTS
+# ============================================================
+
+def process_documents(uploaded_files):
+
+    all_pages = []
+
+    progress_bar = st.progress(
+        0
+    )
+
+    total_files = len(
+        uploaded_files
+    )
+
+    for file_index, uploaded_file in enumerate(
+        uploaded_files
+    ):
+
+        with st.spinner(
+            f"Processing {uploaded_file.name}..."
+        ):
+
+            try:
+
+                pages = process_pdf(
+                    uploaded_file
+                )
+
+                all_pages.extend(
+                    pages
+                )
+
+            except Exception as e:
+
+                st.error(
+                    f"Error processing {uploaded_file.name}: {e}"
+                )
+
+
+        progress_bar.progress(
+            (file_index + 1)
+            / total_files
+        )
+
+
+    progress_bar.empty()
+
+    return all_pages
 
 
 # ============================================================
@@ -319,22 +415,29 @@ def create_embeddings(pages):
 
     if not pages:
 
-        return None
+        return np.array([])
+
 
     texts = []
 
     for page in pages:
 
-        text = page["search_text"]
+        text = page.get(
+            "search_text",
+            ""
+        )
 
         if not text.strip():
 
             text = (
-                f"Document {page['document']} "
-                f"Page {page['page']}"
+                f"Document: {page['document']} "
+                f"Page: {page['page']}"
             )
 
-        texts.append(text)
+        texts.append(
+            text
+        )
+
 
     embeddings = embedding_model.encode(
         texts,
@@ -342,271 +445,370 @@ def create_embeddings(pages):
         show_progress_bar=False
     )
 
-    return np.array(embeddings)
+    return np.asarray(
+        embeddings
+    )
 
 
 # ============================================================
 # RETRIEVE RELEVANT PAGES
 # ============================================================
 
-def retrieve_pages(
+def retrieve_relevant_pages(
     question,
     pages,
     embeddings,
-    top_k=8
+    top_k=6
 ):
 
-    if not pages or embeddings is None:
+    if (
+        not pages
+        or embeddings.size == 0
+    ):
 
         return []
 
-    question_embedding = embedding_model.encode(
+
+    # --------------------------------------------------------
+    # Create query embedding
+    # --------------------------------------------------------
+
+    query_embedding = embedding_model.encode(
         [question],
-        normalize_embeddings=True
+        normalize_embeddings=True,
+        show_progress_bar=False
     )[0]
 
-    scores = np.dot(
+
+    # --------------------------------------------------------
+    # Cosine similarity
+    # --------------------------------------------------------
+
+    similarities = np.dot(
         embeddings,
-        question_embedding
+        query_embedding
     )
 
-    ranked_indices = np.argsort(
-        scores
-    )[::-1]
+
+    # --------------------------------------------------------
+    # Get top results
+    # --------------------------------------------------------
+
+    top_indices = np.argsort(
+        similarities
+    )[::-1][:top_k]
+
 
     results = []
 
-    for index in ranked_indices[:top_k]:
+    for index in top_indices:
 
-        page = pages[index].copy()
+        result = pages[index].copy()
 
-        page["similarity"] = float(
-            scores[index]
+        result["similarity"] = float(
+            similarities[index]
         )
 
-        results.append(page)
+        results.append(
+            result
+        )
+
 
     return results
 
 
 # ============================================================
-# BUILD GEMINI PROMPT
+# FORMAT EVIDENCE
 # ============================================================
 
-def build_prompt(question, retrieved_pages):
+def build_evidence_text(retrieved_pages):
 
-    evidence_text = ""
+    evidence_sections = []
 
     for item in retrieved_pages:
 
-        evidence_text += "\n"
-        evidence_text += "=" * 70
-        evidence_text += "\n"
+        document = item["document"]
+        page = item["page"]
 
-        evidence_text += (
-            f"DOCUMENT: {item['document']}\n"
+        text = item.get(
+            "text",
+            ""
         )
 
-        evidence_text += (
-            f"PAGE: {item['page']}\n"
+        table_text = item.get(
+            "table_text",
+            ""
         )
 
-        evidence_text += "\nTEXT:\n"
-
-        evidence_text += (
-            item["text"][:12000]
+        section = (
+            f"DOCUMENT: {document}\n"
+            f"PAGE: {page}\n"
         )
 
-        if item["table_text"]:
-
-            evidence_text += (
-                "\n\nTABLE DATA:\n"
+        if text:
+            section += (
+                "\nTEXT CONTENT:\n"
+                + text[:12000]
             )
 
-            evidence_text += (
-                item["table_text"][:10000]
+        if table_text:
+            section += (
+                "\n\nTABLE CONTENT:\n"
+                + table_text[:12000]
             )
 
-        evidence_text += "\n"
+        evidence_sections.append(section)
+
+    return "\n\n" + (
+        "\n\n" + "=" * 70 + "\n\n"
+    ).join(evidence_sections)
+
+
+# ============================================================
+# CREATE GEMINI PROMPT
+# ============================================================
+
+def create_prompt(
+    question,
+    retrieved_pages
+):
+
+    evidence = build_evidence_text(
+        retrieved_pages
+    )
+
 
     prompt = f"""
-You are DocMind AI, a multimodal document
-intelligence assistant.
+You are DocMind AI, a multimodal document intelligence assistant.
 
-Your job is to answer the user's question ONLY
-using the retrieved document evidence provided below.
+Your task is to answer the user's question using ONLY the evidence
+provided from the uploaded documents and the page images.
 
 USER QUESTION:
 {question}
 
 RETRIEVED DOCUMENT EVIDENCE:
-{evidence_text}
+{evidence}
 
 IMPORTANT INSTRUCTIONS:
 
-1. Use ONLY the retrieved documents as factual evidence.
+1. Answer the user's question directly.
 
-2. Every important factual claim must contain
-   an exact citation in this format:
+2. Use the retrieved text and tables as evidence.
+
+3. Carefully inspect the supplied page images.
+
+4. Page images may contain:
+   - charts
+   - graphs
+   - scanned text
+   - diagrams
+   - images
+   - tables
+   - visual information that may not appear in extracted text
+
+5. If the question asks about a chart or graph, analyze the actual
+   visual chart rather than assuming the answer from nearby text.
+
+6. If the question asks for numbers, calculate them carefully.
+
+7. For comparisons, clearly identify the values being compared.
+
+8. For cross-document questions, compare information from the
+   relevant documents.
+
+9. EVERY important factual statement must include a citation in this
+   exact format:
 
    [Document: filename, Page: number]
 
-3. If information comes from a table, use the table
-   information directly.
+10. Do not invent document names or page numbers.
 
-4. If the question requires numerical calculations,
-   perform the calculation carefully.
-
-5. If the question involves a chart, graph, diagram,
-   figure, image, scanned page, or visual information,
-   inspect the supplied page images.
-
-6. Do not assume that information exists if it is not
-   visible or present in the retrieved evidence.
-
-7. If there is not enough information to answer the
-   question, say:
+11. If the evidence does not contain enough information, say:
 
    "Insufficient evidence in the retrieved documents."
 
-8. When comparing multiple documents, clearly identify
-   which document each piece of evidence comes from.
+12. Do not use outside knowledge.
 
-9. Give a concise but useful explanation.
+13. If calculations are required, show the calculation briefly.
 
-10. At the end, provide:
+14. At the end, provide:
 
-Evidence Used:
-- Document name, Page number
-- Document name, Page number
+   Evidence Used:
+   - [Document: filename, Page: number]
+   - [Document: filename, Page: number]
 
-The final answer should be evidence-based and
-traceable to the supplied documents.
+15. Keep the answer clear and easy to understand.
+
+Return a professional evidence-based answer.
 """
 
     return prompt
 
 
 # ============================================================
-# GEMINI MULTIMODAL ANSWER
+# GENERATE GEMINI ANSWER
 # ============================================================
 
-def ask_gemini(
+def generate_answer(
     question,
     retrieved_pages
 ):
 
-    prompt = build_prompt(
+    prompt = create_prompt(
         question,
         retrieved_pages
     )
 
-    contents = []
-
-    # Add text prompt
-    contents.append(
-        types.Part.from_text(
-            text=prompt
-        )
-    )
-
-    # Add page images
-    for item in retrieved_pages:
-
-        image_bytes = item.get("image")
-
-        if image_bytes:
-
-            contents.append(
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/png"
-                )
-            )
 
     # --------------------------------------------------------
-    # Retry Gemini if temporarily unavailable
+    # Build Gemini content
     # --------------------------------------------------------
 
-    retry_waits = [
-        10,
-        20,
-        30
+    contents = [
+        prompt
     ]
 
-    for attempt in range(
-        len(retry_waits) + 1
-    ):
+
+    # --------------------------------------------------------
+    # Add page images
+    # --------------------------------------------------------
+
+    for item in retrieved_pages:
+
+        image = item.get(
+            "image"
+        )
+
+        if image is None:
+
+            continue
+
 
         try:
 
-            response = client.models.generate_content(
+            image_buffer = io.BytesIO()
 
-                model=MODEL_NAME,
-
-                contents=contents
-
+            image.save(
+                image_buffer,
+                format="PNG"
             )
 
-            return response.text
+            image_bytes = (
+                image_buffer.getvalue()
+            )
 
-        except Exception as e:
 
-            error_message = str(e)
+            image_part = types.Part.from_bytes(
+                data=image_bytes,
+                mime_type="image/png"
+            )
 
-            if (
-                "503" in error_message
-                or "UNAVAILABLE" in error_message
-                or "temporarily" in error_message.lower()
-            ):
 
-                if attempt < len(retry_waits):
+            contents.append(
+                image_part
+            )
 
-                    wait_time = retry_waits[attempt]
+        except Exception:
 
-                    st.warning(
-                        f"Gemini is temporarily busy. "
-                        f"Retrying in {wait_time} seconds..."
-                    )
+            continue
 
-                    time.sleep(
-                        wait_time
-                    )
 
-                else:
+    # --------------------------------------------------------
+    # Models to try
+    # --------------------------------------------------------
 
-                    return (
-                        "Gemini is currently unavailable. "
-                        "Please try again later."
-                    )
+    models_to_try = [
+        PRIMARY_MODEL,
+        BACKUP_MODEL
+    ]
 
-            else:
 
-                return (
-                    f"Gemini error: {error_message}"
+    last_error = None
+
+
+    # --------------------------------------------------------
+    # Try each model
+    # --------------------------------------------------------
+
+    for model_name in models_to_try:
+
+        for attempt in range(2):
+
+            try:
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents
                 )
 
-    return "Unable to generate an answer."
+
+                if response is not None:
+
+                    answer = response.text
+
+                    if answer:
+
+                        return answer
 
 
-# ============================================================
-# APPLICATION UI
-# ============================================================
+            except Exception as e:
 
-st.title(
-    "📄 DocMind AI"
-)
+                last_error = e
 
-st.subheader(
-    "Multimodal Document Intelligence "
-    "and Evidence-Based Question Answering"
-)
+                error_message = str(
+                    e
+                ).lower()
 
-st.write(
-    "Upload multiple PDFs and ask questions "
-    "using text, tables, scanned pages, and "
-    "document images."
-)
+
+                # ------------------------------------------------
+                # Retry temporary errors
+                # ------------------------------------------------
+
+                temporary_error = (
+                    "503" in error_message
+                    or "unavailable" in error_message
+                    or "temporarily" in error_message
+                    or "overloaded" in error_message
+                    or "busy" in error_message
+                    or "resource exhausted" in error_message
+                    or "429" in error_message
+                )
+
+
+                if temporary_error:
+
+                    if attempt == 0:
+
+                        st.warning(
+                            f"{model_name} is temporarily busy. "
+                            f"Retrying..."
+                        )
+
+                        time.sleep(
+                            8
+                        )
+
+                    continue
+
+
+                # ------------------------------------------------
+                # Other error
+                # ------------------------------------------------
+
+                break
+
+
+    # --------------------------------------------------------
+    # All models failed
+    # --------------------------------------------------------
+
+    return (
+        "Unable to generate the answer right now.\n\n"
+        f"Gemini error: {last_error}\n\n"
+        "The document retrieval system is working, but the "
+        "Gemini generation service is currently unavailable."
+    )
 
 
 # ============================================================
@@ -615,51 +817,35 @@ st.write(
 
 with st.sidebar:
 
-    st.header("⚙️ Settings")
+    st.header(
+        "⚙️ Settings"
+    )
+
 
     top_k = st.slider(
-        "Number of retrieved pages",
+        "Number of pages to retrieve",
         min_value=3,
         max_value=8,
-        value=8
+        value=6
     )
 
-    st.markdown("---")
 
-    st.write(
-        "### Supported Features"
-    )
+    st.divider()
 
-    st.write(
-        "📄 PDF documents"
-    )
 
-    st.write(
-        "📝 Text extraction"
-    )
+    st.markdown(
+        """
+        ### Supported Content
 
-    st.write(
-        "📊 Table extraction"
-    )
-
-    st.write(
-        "🔤 OCR for scanned pages"
-    )
-
-    st.write(
-        "🖼️ Page image analysis"
-    )
-
-    st.write(
-        "🔎 Semantic search"
-    )
-
-    st.write(
-        "🤖 Gemini multimodal reasoning"
-    )
-
-    st.write(
-        "📌 Page-level evidence"
+        📄 PDF Text  
+        📊 Tables  
+        📈 Charts  
+        📉 Graphs  
+        🖼️ Images  
+        🔍 OCR Scanned Pages  
+        🤖 Vision-Language Analysis  
+        🔗 Page-Level Evidence
+        """
     )
 
 
@@ -667,140 +853,168 @@ with st.sidebar:
 # PDF UPLOAD
 # ============================================================
 
+st.header(
+    "📂 Upload Documents"
+)
+
+
 uploaded_files = st.file_uploader(
-
-    "Upload PDF documents",
-
+    "Upload one or more PDF documents",
     type=["pdf"],
-
     accept_multiple_files=True
 )
 
 
 # ============================================================
-# PROCESS UPLOADED DOCUMENTS
+# SESSION STATE
+# ============================================================
+
+if "pages" not in st.session_state:
+
+    st.session_state.pages = []
+
+
+if "embeddings" not in st.session_state:
+
+    st.session_state.embeddings = np.array([])
+
+
+if "processed" not in st.session_state:
+
+    st.session_state.processed = False
+
+
+# ============================================================
+# PROCESS BUTTON
 # ============================================================
 
 if uploaded_files:
 
-    st.session_state.pages = []
+    if st.button(
+        "🔄 Process Documents",
+        type="primary"
+    ):
 
-    st.session_state.embeddings = None
+        with st.spinner(
+            "Processing documents..."
+        ):
 
-    st.subheader(
+            pages = process_documents(
+                uploaded_files
+            )
+
+
+            embeddings = create_embeddings(
+                pages
+            )
+
+
+            st.session_state.pages = pages
+
+            st.session_state.embeddings = embeddings
+
+            st.session_state.processed = True
+
+
+        st.success(
+            f"Successfully processed "
+            f"{len(uploaded_files)} document(s) "
+            f"and {len(pages)} page(s)."
+        )
+
+
+# ============================================================
+# DOCUMENT SUMMARY
+# ============================================================
+
+if st.session_state.processed:
+
+    pages = st.session_state.pages
+
+
+    st.header(
         "📚 Loaded Documents"
     )
 
-    for uploaded_file in uploaded_files:
 
-        with st.spinner(
-            f"Processing {uploaded_file.name}..."
-        ):
-
-            pages = process_pdf(
-                uploaded_file
-            )
-
-        st.session_state.pages.extend(
-            pages
-        )
-
-        st.success(
-            f"{uploaded_file.name} "
-            f"— {len(pages)} pages processed"
-        )
-
-    # --------------------------------------------------------
-    # Create embeddings
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Creating semantic embeddings..."
-    ):
-
-        st.session_state.embeddings = (
-            create_embeddings(
-                st.session_state.pages
+    documents = sorted(
+        list(
+            set(
+                page["document"]
+                for page in pages
             )
         )
-
-    st.success(
-        f"Processed {len(st.session_state.pages)} pages successfully."
     )
 
 
-# ============================================================
-# DOCUMENT INFORMATION
-# ============================================================
-
-if st.session_state.pages:
-
-    st.subheader(
-        "📑 Document Summary"
-    )
-
-    document_names = sorted(
-        set(
-            page["document"]
-            for page in st.session_state.pages
-        )
-    )
-
-    for document_name in document_names:
+    for document in documents:
 
         document_pages = [
             page
-            for page in st.session_state.pages
-            if page["document"] == document_name
+            for page in pages
+            if page["document"] == document
         ]
 
+
         ocr_pages = sum(
-            page["ocr_used"]
+            1
             for page in document_pages
+            if page["ocr_used"]
         )
+
 
         table_pages = sum(
-            len(page["tables"]) > 0
+            1
             for page in document_pages
-        )
-
-        st.write(
-            f"**{document_name}** — "
-            f"{len(document_pages)} pages | "
-            f"OCR pages: {ocr_pages} | "
-            f"Pages containing tables: {table_pages}"
+            if page["tables"]
         )
 
 
+        with st.expander(
+            f"📄 {document}"
+        ):
+
+            st.write(
+                f"Pages: {len(document_pages)}"
+            )
+
+            st.write(
+                f"OCR pages: {ocr_pages}"
+            )
+
+            st.write(
+                f"Pages containing tables: {table_pages}"
+            )
+
+
 # ============================================================
-# QUESTION ANSWERING
+# QUESTION SECTION
 # ============================================================
 
-if st.session_state.pages:
+if st.session_state.processed:
 
-    st.markdown("---")
+    st.divider()
 
-    st.subheader(
-        "🔎 Ask a Question"
+
+    st.header(
+        "💬 Ask Questions"
     )
 
+
     question = st.text_area(
-        "Enter your question:",
+        "Ask a question about your documents:",
         placeholder=(
-            "Example: Compare the production "
-            "efficiency between Q2 and Q4. "
-            "Identify the three biggest reasons "
-            "for the change and provide the evidence."
+            "Example: Compare production efficiency "
+            "between Q2 and Q4 and explain the reasons."
         ),
         height=100
     )
 
-    ask_button = st.button(
-        "🚀 Ask DocMind AI",
-        type="primary"
-    )
 
-    if ask_button:
+    if st.button(
+        "🔍 Ask DocMind AI",
+        type="primary"
+    ):
 
         if not question.strip():
 
@@ -811,106 +1025,127 @@ if st.session_state.pages:
         else:
 
             # ------------------------------------------------
-            # RETRIEVAL
+            # Retrieve evidence
             # ------------------------------------------------
 
             with st.spinner(
                 "Searching documents..."
             ):
 
-                retrieved_pages = retrieve_pages(
-
+                retrieved_pages = retrieve_relevant_pages(
                     question,
-
                     st.session_state.pages,
-
                     st.session_state.embeddings,
-
                     top_k
-
                 )
 
+
             # ------------------------------------------------
-            # RETRIEVED EVIDENCE
+            # Display retrieved evidence
             # ------------------------------------------------
 
             st.subheader(
                 "🔍 Retrieved Evidence"
             )
 
+
             for item in retrieved_pages:
+
+                similarity = item[
+                    "similarity"
+                ]
+
 
                 st.write(
                     f"**{item['document']}** "
-                    f"— Page {item['page']} "
+                    f"— Page **{item['page']}** "
                     f"— Similarity: "
-                    f"{item['similarity']:.3f}"
+                    f"**{similarity:.3f}**"
                 )
 
-                if item["ocr_used"]:
-
-                    st.caption(
-                        "🔤 OCR was used on this page."
-                    )
 
             # ------------------------------------------------
-            # GEMINI ANSWER
+            # Generate answer
             # ------------------------------------------------
 
             st.subheader(
                 "🤖 DocMind AI Answer"
             )
 
+
             with st.spinner(
                 "Analyzing evidence and generating answer..."
             ):
 
-                answer = ask_gemini(
-
+                answer = generate_answer(
                     question,
-
                     retrieved_pages
-
                 )
+
 
             st.markdown(
                 answer
             )
 
+
             # ------------------------------------------------
-            # SUPPORTING PAGE IMAGES
+            # Supporting pages
             # ------------------------------------------------
 
+            st.divider()
+
+
             st.subheader(
-                "🖼️ Supporting Evidence Pages"
+                "🖼️ Supporting Document Pages"
             )
+
 
             for item in retrieved_pages:
 
-                image_bytes = item.get(
+                image = item.get(
                     "image"
                 )
 
-                if image_bytes:
 
-                    st.markdown(
-                        f"**{item['document']} "
-                        f"— Page {item['page']}**"
-                    )
+                if image is None:
 
-                    st.image(
-                        image_bytes,
-                        use_container_width=True
-                    )
+                    continue
+
+
+                caption = (
+                    f"{item['document']} — "
+                    f"Page {item['page']}"
+                )
+
+
+                st.image(
+                    image,
+                    caption=caption,
+                    width="stretch"
+                )
+
+
+# ============================================================
+# INITIAL INSTRUCTIONS
+# ============================================================
+
+else:
+
+    st.info(
+        """
+        👆 Upload one or more PDF documents and click
+        **Process Documents** to begin.
+        """
+    )
 
 
 # ============================================================
 # FOOTER
 # ============================================================
 
-st.markdown("---")
+st.divider()
 
 st.caption(
-    "DocMind AI | Multimodal Document Intelligence | "
-    "Text + Tables + OCR + Page Images + RAG + Gemini"
+    "DocMind AI — Multimodal Document Intelligence "
+    "and Evidence-Based Question Answering System"
 )
