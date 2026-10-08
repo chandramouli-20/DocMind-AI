@@ -314,6 +314,9 @@ if "processed" not in st.session_state:
 if "last_answer" not in st.session_state:
     st.session_state.last_answer = ""
 
+if "document_stats" not in st.session_state:
+    st.session_state.document_stats = ({}, {})
+
 
 # ============================================================
 # EMBEDDING MODEL
@@ -501,6 +504,208 @@ def tables_to_text(tables):
     return "\n".join(output)
 
 
+
+# ============================================================
+# DOCUMENT METADATA / STATISTICS
+# ============================================================
+
+def count_words(text):
+    """Count words from extracted/OCR text."""
+    if not text:
+        return 0
+    return len(re.findall(r"\b[\w'-]+\b", text, flags=re.UNICODE))
+
+
+def get_document_statistics(pages):
+    """Calculate exact statistics from all processed PDF pages."""
+    stats_by_doc = {}
+
+    for page in pages:
+        doc = page["document"]
+
+        if doc not in stats_by_doc:
+            stats_by_doc[doc] = {
+                "pages": 0,
+                "words": 0,
+                "characters": 0,
+                "ocr_pages": 0,
+                "tables": 0,
+                "images": 0,
+                "text_pages": 0,
+                "empty_pages": 0
+            }
+
+        s = stats_by_doc[doc]
+        s["pages"] += 1
+
+        text = page.get("text", "") or ""
+        s["words"] += count_words(text)
+        s["characters"] += len(text)
+        s["tables"] += len(page.get("tables", []))
+        s["images"] += page.get("image_count", 0)
+
+        if page.get("ocr_used", False):
+            s["ocr_pages"] += 1
+
+        if text.strip():
+            s["text_pages"] += 1
+        else:
+            s["empty_pages"] += 1
+
+    total = {
+        "pages": sum(x["pages"] for x in stats_by_doc.values()),
+        "words": sum(x["words"] for x in stats_by_doc.values()),
+        "characters": sum(x["characters"] for x in stats_by_doc.values()),
+        "ocr_pages": sum(x["ocr_pages"] for x in stats_by_doc.values()),
+        "tables": sum(x["tables"] for x in stats_by_doc.values()),
+        "images": sum(x["images"] for x in stats_by_doc.values()),
+        "documents": len(stats_by_doc)
+    }
+
+    return stats_by_doc, total
+
+
+def is_metadata_question(question):
+    """Detect questions that need exact whole-document statistics."""
+    q = question.lower().strip()
+
+    metadata_terms = [
+        "how many pages", "number of pages", "total pages", "page count",
+        "how many words", "number of words", "total words", "word count",
+        "how many characters", "number of characters", "character count",
+        "how many letters", "total characters",
+        "how many images", "number of images", "image count",
+        "how many tables", "number of tables", "table count",
+        "how many ocr", "ocr pages", "scanned pages", "number of scanned",
+        "how many documents", "number of documents", "document count",
+        "average words per page", "average words/page",
+        "average characters per page",
+        "document statistics", "document stats", "pdf statistics",
+        "pdf stats", "metadata"
+    ]
+
+    return any(term in q for term in metadata_terms)
+
+
+def answer_metadata_question(question, pages):
+    """
+    Answer document-wide statistical questions directly from Python.
+    Gemini is intentionally NOT used for exact counts.
+    """
+    q = question.lower().strip()
+    stats_by_doc, total = get_document_statistics(pages)
+
+    # Determine whether the user is asking about one named document.
+    selected_doc = None
+    for doc in stats_by_doc:
+        if doc.lower() in q:
+            selected_doc = doc
+            break
+
+    if selected_doc:
+        s = stats_by_doc[selected_doc]
+        scope = f"**{selected_doc}**"
+    else:
+        s = total
+        scope = "the uploaded documents"
+
+    # Pages
+    if any(x in q for x in [
+        "how many pages", "number of pages", "total pages", "page count"
+    ]):
+        if selected_doc:
+            return (
+                f"**{scope} contains {s['pages']} page(s).**\n\n"
+                f"Source: `{selected_doc}` — all pages were counted directly from the PDF."
+            )
+        return (
+            f"**The uploaded documents contain {s['pages']} page(s) in total.**\n\n"
+            "This count is calculated directly from the PDF files."
+        )
+
+    # Words
+    if any(x in q for x in [
+        "how many words", "number of words", "total words", "word count"
+    ]):
+        if selected_doc:
+            return (
+                f"**{scope} contains {s['words']:,} words.**\n\n"
+                f"Source: `{selected_doc}` — text from normal and OCR pages was counted."
+            )
+        return (
+            f"**The uploaded documents contain {s['words']:,} words in total.**\n\n"
+            "The count includes text extracted from normal PDF pages and OCR text from scanned pages."
+        )
+
+    # Characters
+    if any(x in q for x in [
+        "how many characters", "number of characters", "character count",
+        "how many letters", "total characters"
+    ]):
+        return (
+            f"**{scope} contains {s['characters']:,} characters.**\n\n"
+            "Characters are counted from the extracted/OCR text."
+        )
+
+    # Images
+    if any(x in q for x in [
+        "how many images", "number of images", "image count"
+    ]):
+        return (
+            f"**{scope} contains {s['images']:,} embedded image(s).**\n\n"
+            "This counts embedded PDF images, not the rendered page images used for OCR."
+        )
+
+    # Tables
+    if any(x in q for x in [
+        "how many tables", "number of tables", "table count"
+    ]):
+        return f"**{scope} contains {s['tables']:,} detected table(s).**"
+
+    # OCR/scanned pages
+    if any(x in q for x in [
+        "how many ocr", "ocr pages", "scanned pages", "number of scanned"
+    ]):
+        return (
+            f"**{scope} contains {s['ocr_pages']:,} page(s) processed using OCR.**\n\n"
+            "OCR was used when the page had very little extractable PDF text."
+        )
+
+    # Documents
+    if any(x in q for x in [
+        "how many documents", "number of documents", "document count"
+    ]):
+        return f"**There are {s['documents']:,} uploaded document(s).**"
+
+    # Average words/page
+    if any(x in q for x in [
+        "average words per page", "average words/page"
+    ]):
+        avg = s["words"] / s["pages"] if s["pages"] else 0
+        return f"**Average words per page: {avg:,.2f} words/page.**"
+
+    # Average chars/page
+    if "average characters per page" in q:
+        avg = s["characters"] / s["pages"] if s["pages"] else 0
+        return f"**Average characters per page: {avg:,.2f} characters/page.**"
+
+    # General statistics
+    if "stat" in q or "metadata" in q:
+        document_count = len(stats_by_doc) if not selected_doc else 1
+        return (
+            f"### Document Statistics\n\n"
+            f"- **Documents:** {document_count:,}\n"
+            f"- **Pages:** {s['pages']:,}\n"
+            f"- **Words:** {s['words']:,}\n"
+            f"- **Characters:** {s['characters']:,}\n"
+            f"- **OCR/Scanned Pages:** {s['ocr_pages']:,}\n"
+            f"- **Detected Tables:** {s['tables']:,}\n"
+            f"- **Embedded Images:** {s['images']:,}\n"
+        )
+
+    return None
+
+
 # ============================================================
 # PROCESS PDF
 # ============================================================
@@ -585,7 +790,8 @@ def process_pdf(uploaded_file):
                 "table_text": table_text,
                 "search_text": search_text,
                 "image": image,
-                "ocr_used": ocr_used
+                "ocr_used": ocr_used,
+                "image_count": len(page.get_images(full=True))
             }
         )
 
@@ -1357,6 +1563,7 @@ if uploaded_files:
         st.session_state.embeddings = None
 
         st.session_state.processed = False
+        st.session_state.document_stats = ({}, {})
 
         all_pages = []
 
@@ -1404,6 +1611,14 @@ if uploaded_files:
             )
 
         if all_pages:
+
+            status.write(
+                "📊 Calculating document statistics..."
+            )
+
+            st.session_state.document_stats = (
+                get_document_statistics(all_pages)
+            )
 
             status.write(
                 "🧩 Creating semantic embeddings..."
@@ -1471,7 +1686,7 @@ if st.session_state.processed:
         "## 📊 Workspace Overview"
     )
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     with c1:
 
@@ -1531,6 +1746,46 @@ f"""
 </div>
 <div class="stat-label">
 OCR Pages
+</div>
+</div>
+""",
+            unsafe_allow_html=True
+        )
+
+    total_words = sum(
+        count_words(page.get("text", ""))
+        for page in pages
+    )
+
+    with c5:
+        st.markdown(
+f"""
+<div class="stat-card">
+<div class="stat-number">
+{total_words:,}
+</div>
+<div class="stat-label">
+Words
+</div>
+</div>
+""",
+            unsafe_allow_html=True
+        )
+
+    total_images = sum(
+        page.get("image_count", 0)
+        for page in pages
+    )
+
+    with c6:
+        st.markdown(
+f"""
+<div class="stat-card">
+<div class="stat-number">
+{total_images:,}
+</div>
+<div class="stat-label">
+Images
 </div>
 </div>
 """,
@@ -1604,139 +1859,183 @@ if st.session_state.processed:
         else:
 
             # ================================================
-            # RETRIEVAL
+            # DOCUMENT-WIDE METADATA QUESTIONS
             # ================================================
+            # Exact statistics are calculated locally from ALL
+            # processed pages. Do not ask Gemini to estimate them.
 
-            with st.spinner(
-                "🔎 Searching relevant pages..."
-            ):
+            metadata_answer = None
 
-                retrieved_pages = retrieve_pages(
+            if is_metadata_question(question):
+                metadata_answer = answer_metadata_question(
                     question,
-                    st.session_state.pages,
-                    st.session_state.embeddings,
-                    top_k=4
+                    st.session_state.pages
                 )
 
-            if not retrieved_pages:
-
-                st.error(
-                    "No relevant evidence found."
-                )
-
-            else:
-
-                # ============================================
-                # RETRIEVED EVIDENCE
-                # ============================================
-
-                with st.expander(
-                    "🔎 View Retrieved Evidence"
-                ):
-
-                    for item in retrieved_pages:
-
-                        st.markdown(
-f"""
-<div class="evidence-card">
-
-<div class="source-tag">
-{item["document"]}
-</div>
-
-<br><br>
-
-<b>📄 Page {item["page"]}</b>
-
-<br>
-
-<span class="small-muted">
-Similarity score:
-{item["score"]:.4f}
-</span>
-
-</div>
-""",
-                            unsafe_allow_html=True
-                        )
-
-                        text_preview = item.get(
-                            "text",
-                            ""
-                        )
-
-                        if text_preview:
-
-                            st.write(
-                                text_preview[:1500]
-                            )
-
-                        table_preview = item.get(
-                            "table_text",
-                            ""
-                        )
-
-                        if table_preview:
-
-                            st.markdown(
-                                "**📊 Table:**"
-                            )
-
-                            st.code(
-                                table_preview[:2500]
-                            )
-
-                # ============================================
-                # GEMINI
-                # ============================================
-
-                with st.spinner(
-                    "🤖 Gemini is analyzing the evidence..."
-                ):
-
-                    answer = generate_answer(
-                        question,
-                        retrieved_pages
-                    )
-
-                st.session_state.last_answer = (
-                    answer
-                )
-
-                # ============================================
-                # ANSWER
-                # ============================================
+            if metadata_answer:
+                st.session_state.last_answer = metadata_answer
 
                 st.markdown(
                     "## 🧠 Answer"
                 )
 
                 st.markdown(
-"""
+                    f"""
 <div class="answer-card">
 """,
                     unsafe_allow_html=True
                 )
 
-                st.markdown(
-                    answer
-                )
+                st.markdown(metadata_answer)
 
                 st.markdown(
-"""
+                    """
 </div>
 """,
                     unsafe_allow_html=True
                 )
 
-                # ============================================
-                # SUPPORTING EVIDENCE
-                # ============================================
-
-                display_supporting_pages(
-                    answer,
-                    retrieved_pages
+                st.info(
+                    "📊 This answer was calculated directly from the uploaded PDF data, not generated by Gemini."
                 )
+
+            else:
+
+                # ================================================
+                # RETRIEVAL FOR CONTENT QUESTIONS
+                # ================================================
+
+                with st.spinner(
+                    "🔎 Searching relevant pages..."
+                ):
+
+                    retrieved_pages = retrieve_pages(
+                        question,
+                        st.session_state.pages,
+                        st.session_state.embeddings,
+                        top_k=4
+                    )
+
+                if not retrieved_pages:
+
+                    st.error(
+                        "No relevant evidence found."
+                    )
+
+                else:
+
+                    # ============================================
+                    # RETRIEVED EVIDENCE
+                    # ============================================
+
+                    with st.expander(
+                        "🔎 View Retrieved Evidence"
+                    ):
+
+                        for item in retrieved_pages:
+
+                            st.markdown(
+    f"""
+    <div class="evidence-card">
+
+    <div class="source-tag">
+    {item["document"]}
+    </div>
+
+    <br><br>
+
+    <b>📄 Page {item["page"]}</b>
+
+    <br>
+
+    <span class="small-muted">
+    Similarity score:
+    {item["score"]:.4f}
+    </span>
+
+    </div>
+    """,
+                                unsafe_allow_html=True
+                            )
+
+                            text_preview = item.get(
+                                "text",
+                                ""
+                            )
+
+                            if text_preview:
+
+                                st.write(
+                                    text_preview[:1500]
+                                )
+
+                            table_preview = item.get(
+                                "table_text",
+                                ""
+                            )
+
+                            if table_preview:
+
+                                st.markdown(
+                                    "**📊 Table:**"
+                                )
+
+                                st.code(
+                                    table_preview[:2500]
+                                )
+
+                    # ============================================
+                    # GEMINI
+                    # ============================================
+
+                    with st.spinner(
+                        "🤖 Gemini is analyzing the evidence..."
+                    ):
+
+                        answer = generate_answer(
+                            question,
+                            retrieved_pages
+                        )
+
+                    st.session_state.last_answer = (
+                        answer
+                    )
+
+                    # ============================================
+                    # ANSWER
+                    # ============================================
+
+                    st.markdown(
+                        "## 🧠 Answer"
+                    )
+
+                    st.markdown(
+    """
+    <div class="answer-card">
+    """,
+                        unsafe_allow_html=True
+                    )
+
+                    st.markdown(
+                        answer
+                    )
+
+                    st.markdown(
+    """
+    </div>
+    """,
+                        unsafe_allow_html=True
+                    )
+
+                    # ============================================
+                    # SUPPORTING EVIDENCE
+                    # ============================================
+
+                    display_supporting_pages(
+                        answer,
+                        retrieved_pages
+                    )
+
 
 
 # ============================================================
